@@ -1,0 +1,4 @@
+{
+  "pages": {"settings": {"title": "语料归档", "description": "管理记录范围、存储容量和 ZIP 导出。"}},
+  "views": {"settings": {"title": "语料归档", "description": "管理记录范围、存储容量和 ZIP 导出。"}}
+}

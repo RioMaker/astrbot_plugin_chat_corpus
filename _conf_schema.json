@@ -1,0 +1,20 @@
+{
+  "group_ids": {
+    "type": "list",
+    "description": "记录的 QQ 群号",
+    "default": [],
+    "hint": "打开「语料归档」视图可按群名、群号和人数勾选。留空暂停采集，已归档的群仍可导出。"
+  },
+  "capacity_mib": {
+    "type": "int",
+    "description": "总容量上限（MiB）",
+    "default": 1024,
+    "hint": "所有群共用，包含消息、附件和数据库索引。1024 MiB 等于 1 GiB。"
+  },
+  "rolling": {
+    "type": "bool",
+    "description": "动态存储",
+    "default": false,
+    "hint": "开启后按消息时间从旧到新清理。关闭时保留已有记录，跳过放不下的新消息。"
+  }
+}

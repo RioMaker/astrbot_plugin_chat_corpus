@@ -1,0 +1,67 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width,initial-scale=1">
+  <title>对话语料库</title>
+  <link rel="stylesheet" href="./style.css">
+  <script type="module" src="./app.js"></script>
+</head>
+<body>
+<main>
+  <header>
+    <div><h1>对话语料库</h1><p id="scope">正在读取归档状态…</p></div>
+    <button type="button" id="refresh" class="secondary" disabled>刷新状态</button>
+  </header>
+  <section class="overview" aria-label="归档状态">
+    <div class="capacity"><span>存储用量</span><strong id="used">—</strong>
+      <progress id="meter" max="100" value="0" aria-label="容量使用比例"></progress>
+    </div>
+    <div><span>已存消息</span><strong id="messages">—</strong></div>
+    <div><span>媒体文件</span><strong id="media">—</strong></div>
+    <p id="details" hidden></p>
+  </section>
+  <div class="panels">
+    <form id="settings">
+      <h2>采集设置</h2>
+      <fieldset disabled id="settingFields">
+        <div class="picker-head">
+          <label id="groupLabel" for="groupSearch">记录的 QQ 群</label>
+          <button type="button" id="reloadGroups" class="secondary">刷新群列表</button>
+        </div>
+        <input type="search" id="groupSearch" placeholder="搜索群名或群号" aria-label="搜索群名或群号">
+        <div id="groupRows" class="group-list" role="group" aria-labelledby="groupLabel"></div>
+        <small id="discovery" role="status">正在识别机器人加入的 QQ 群…</small>
+        <small id="picked"></small>
+        <label for="capacity">总容量上限 <span>MiB</span></label>
+        <input id="capacity" type="number" inputmode="numeric" min="1" max="2147483647" step="1" required>
+        <label class="toggle"><input id="rolling" type="checkbox">开启动态存储</label>
+        <small id="retention"></small>
+        <button type="submit" id="save">保存设置</button>
+      </fieldset>
+      <p class="feedback" role="status" id="saveResult"></p>
+    </form>
+    <form id="export">
+      <h2>导出语料包</h2>
+      <fieldset disabled id="exportFields">
+        <label for="exportGroup">归档群</label>
+        <select id="exportGroup"><option value="">全部归档群</option></select>
+        <div class="dates">
+          <div><label for="since">开始日期</label><input type="date" id="since"></div>
+          <div><label for="until">结束日期</label><input type="date" id="until"></div>
+        </div>
+        <small>按本地日期筛选，包含首尾两天。留空导出全部日期。</small>
+        <div class="contents"><strong>ZIP 内容</strong>
+          <span><code>messages.jsonl</code>按时间排序的消息</span>
+          <span><code>media/</code>消息引用的图片和语音</span>
+          <span><code>manifest.json</code>导出范围与数量</span>
+        </div>
+        <button type="submit" id="download">打包并下载 ZIP</button>
+      </fieldset>
+      <p class="feedback" role="status" id="exportResult"></p>
+    </form>
+  </div>
+  <p class="feedback" role="alert" id="pageError"></p>
+</main>
+</body>
+</html>
