@@ -7,7 +7,7 @@ from contextlib import closing
 from threading import Event
 
 import pytest
-from astrbot_plugin_chat_corpus.archive import Archive
+from astrbot_plugin_chat_corpus.archive import SCHEMA, Archive
 from astrbot_plugin_chat_corpus.media import Asset
 from astrbot_plugin_chat_corpus.settings import MIB, ExportRange, Settings
 
@@ -60,6 +60,12 @@ def contents(store, selection=None):
         )
 
 
+def recognize(store, asset):
+    text = {"ocr_text": "南门集合", "description": "群活动通知"}
+    assert store.save_recognition(asset.digest, text, Settings.read({}))
+    return text
+
+
 def test_empty_bundle(store):
     records, manifest, media = contents(store)
     assert records == [] and media == {}
@@ -99,13 +105,15 @@ def test_no_rolling_preserves_history_at_physical_limit(store, tmp_path):
     assert store.path.stat().st_size == store.status()["used_bytes"] <= MIB
 
 
-def test_global_fifo_shared_blobs_and_physical_reclamation(store, tmp_path):
+def test_files_roll_by_latest_reference_without_losing_text(store, tmp_path):
     common = asset_file(tmp_path, "c", 180_000)
     unique = asset_file(tmp_path, "u", 270_000)
     # The newest message was received first.
     add(store, message(3, 300, "456", asset=common), common)
     add(store, message(1, 100, "123", text="x" * 180_000, asset=common), common)
     add(store, message(2, 200, "123", asset=unique), unique)
+    recognize(store, common)
+    text = recognize(store, unique)
     baseline = store.path.stat().st_size
     assert (
         add(
@@ -117,17 +125,29 @@ def test_global_fifo_shared_blobs_and_physical_reclamation(store, tmp_path):
         == "stored"
     )
     records, _, files = contents(store)
-    assert [r["message_id"] for r in records] == ["2", "3", "4"]
+    assert [r["message_id"] for r in records] == ["1", "2", "3", "4"]
+    assert unique.reference()["path"] not in files
+    segment = records[1]["segments"][1]
+    assert (
+        segment["recognition"] == text
+        and segment["media"]["missing"] == "capacity_evicted"
+    )
+    assert "path" not in segment["media"]
     assert files[common.reference()["path"]] == common.path.read_bytes()
-    assert store.status()["evicted"] == 1
+    assert store.status()["evicted"] == 0 and store.status()["cleared_media"] == 1
     assert store.path.stat().st_size <= baseline
-    # Once the oldest remaining message no longer fits, its exclusive attachment disappears.
+    # More text now needs the space occupied by the shared original.
     assert (
         add(store, message(5, 500, text="z" * 200_000), limit=baseline, rolling=True)
         == "stored"
     )
-    assert unique.reference()["path"] not in contents(store)[2]
-    assert common.reference()["path"] in contents(store)[2]
+    records, manifest, files = contents(store)
+    assert not files and len(records) == 5
+    assert (
+        manifest["recognized_media_segments"] == manifest["cleared_media_segments"] == 3
+    )
+    assert store.status()["cleared_media"] == 2 and store.status()["evicted"] == 0
+    assert records[0]["segments"][0]["data"]["text"] == "x" * 180_000
     assert store.path.stat().st_size <= baseline
 
 
@@ -140,9 +160,8 @@ def test_impossible_or_out_of_order_record_cannot_erase_history(store, tmp_path)
         add(store, message(5, 1, text="late" * 12_000), limit=limit, rolling=True)
         == "full"
     )
-    item = asset_file(tmp_path, "q", limit - 8192)
     assert (
-        add(store, message(6, 60, asset=item), item, limit=limit, rolling=True)
+        add(store, message(6, 60, text="x" * limit), limit=limit, rolling=True)
         == "full"
     )
     assert contents(store)[0] == before
@@ -184,6 +203,7 @@ def test_writes_are_idempotent_and_failed_copy_rolls_back(store, tmp_path):
 def test_export_stays_consistent_during_retention(store, tmp_path):
     item = asset_file(tmp_path, "a", 450_000)
     add(store, message(1, asset=item), item)
+    recognize(store, item)
     with store.export(ExportRange()) as file:
         add(store, message(2, 200, text="n" * 700_000), rolling=True)
         with zipfile.ZipFile(file) as bundle:
@@ -195,6 +215,7 @@ def test_export_stays_consistent_during_retention(store, tmp_path):
 def test_export_of_existing_archive_allows_concurrent_retention(store, tmp_path):
     item = asset_file(tmp_path, "a", 450_000)
     add(store, message(1, asset=item), item)
+    recognize(store, item)
     # Simulate reopening a populated 0.1.0 database in rollback journal mode.
     with closing(sqlite3.connect(store.path)) as db:
         assert db.execute("PRAGMA journal_mode=DELETE").fetchone() == ("delete",)
@@ -220,3 +241,154 @@ def test_export_of_existing_archive_allows_concurrent_retention(store, tmp_path)
             assert bundle.testzip() is None
             assert json.loads(bundle.read("messages.jsonl"))["message_id"] == "1"
             assert bundle.read(item.reference()["path"]) == item.path.read_bytes()
+
+
+def test_failed_original_survives_and_incoming_mixed_message_keeps_text(
+    store, tmp_path
+):
+    first = asset_file(tmp_path, "a", 740_000)
+    large = asset_file(tmp_path, "b", 620_000)
+    assert add(store, message(1, asset=first), first) == "stored"
+    assert not store.save_recognition(first.digest, {}, Settings.read({}))
+    lease = store.next_recognition()[3]
+    store.release_recognition(first.digest, lease, retry=True)
+    mixed = message(2, 200, text="保留正文", asset=large)
+    media_part = mixed["segments"][1]
+    mixed["segments"].append({"type": "node", "data": {"content": [dict(media_part)]}})
+    assert add(store, mixed, large, rolling=True) == "stored"
+    pure = message(3, 300, text="", asset=large)
+    assert add(store, pure, large, rolling=True) == "full"
+    rows, manifest, files = contents(store)
+    assert list(files) == [first.reference()["path"]]
+    kept, image, node = rows[1]["segments"]
+    assert kept["data"]["text"] == "保留正文"
+    assert node["data"]["content"][0]["media"] == image["media"]
+    assert (
+        image["media"]["missing"] == "capacity_skipped" and "path" not in image["media"]
+    )
+    assert manifest["missing_media_segments"] == 2 and store.status()["evicted"] == 0
+
+
+def test_pure_recognized_media_survives_as_text_in_forward_and_future_duplicates(
+    store, tmp_path
+):
+    image = asset_file(tmp_path, "i", 650_000)
+    record = message(1, text="", asset=image)
+    record["segments"] = [
+        {
+            "type": "forward",
+            "data": {
+                "content": [
+                    {"type": "node", "data": {"content": [record["segments"][1]]}}
+                ]
+            },
+        }
+    ]
+    add(store, record, image)
+    text = recognize(store, image)
+    assert add(store, message(2, 110, text="t" * 600_000), rolling=True) == "stored"
+    assert (
+        add(store, message(3, 120, "456", text="", asset=image), image, rolling=True)
+        == "stored"
+    )
+    records, manifest, files = contents(store)
+    nested = records[0]["segments"][0]["data"]["content"][0]["data"]["content"][0]
+    assert nested["recognition"] == records[2]["segments"][1]["recognition"] == text
+    assert nested["media"]["missing"] == "capacity_evicted" and not files
+    assert (
+        manifest["recognized_media_segments"] == manifest["missing_media_segments"] == 2
+    )
+    assert store.next_recognition() is None and store.status()["recognized"] == 1
+
+
+def test_old_database_waits_for_recognition_before_shrinking(tmp_path):
+    folder = tmp_path / "data"
+    folder.mkdir()
+    store = Archive(folder)
+    legacy = asset_file(tmp_path, "l", 1_100_000)
+    record = message(1, text="旧库原文", asset=legacy)
+    with closing(sqlite3.connect(store.path)) as db:
+        db.execute("PRAGMA auto_vacuum=FULL")
+        db.executescript(SCHEMA)
+        db.execute(
+            "INSERT INTO messages VALUES(1,'qq','7','123','1',100,1,?,0)",
+            (json.dumps(record),),
+        )
+        db.execute(
+            "INSERT INTO media VALUES(1,?,'png',?)",
+            (legacy.digest, legacy.path.read_bytes()),
+        )
+        db.execute("INSERT INTO refs VALUES(1,1)")
+        db.commit()
+    store.initialize(Settings.read({}))
+    assert store.next_recognition() is None
+    reduced = Settings.read({"capacity_mib": 1, "rolling": True})
+    store.apply_limit(reduced)
+    job = store.next_recognition()
+    assert job[:3] == (legacy.digest, "png", "qq:GroupMessage:123")
+    assert not store.save_recognition(
+        legacy.digest, {"description": "", "ocr_text": "   "}, reduced
+    )
+    store.release_recognition(legacy.digest, job[3], retry=True)
+    store.initialize(reduced)
+    assert (
+        store.next_recognition() is None and store.status()["retrying_recognition"] == 1
+    )
+    assert contents(store)[2][legacy.reference()["path"]] == legacy.path.read_bytes()
+    assert store.save_recognition(
+        legacy.digest, {"ocr_text": "历史", "description": "旧海报"}, reduced
+    )
+    rows, _, files = contents(store)
+    assert rows[0]["segments"][0]["data"]["text"] == "旧库原文"
+    assert rows[0]["segments"][1]["recognition"]["ocr_text"] == "历史"
+    assert not files and store.path.stat().st_size <= reduced.limit
+    assert store.status()["retrying_recognition"] == store.status()["evicted"] == 0
+
+
+def test_pressure_waits_for_available_recognition_before_evicting_old_text(
+    store, tmp_path
+):
+    item = asset_file(tmp_path, "p", 400_000)
+    add(store, message(1, 100, text="x" * 340_000))
+    add(store, message(2, 200, asset=item), item)
+    incoming = message(3, 300, text="y" * 360_000)
+    assert store.append(incoming, {}, 0, MIB, True, wait_for_media=True) == "waiting"
+    assert store.status()["messages"] == 2 and store.status()["skipped"] == 0
+    recognize(store, item)
+    assert store.append(incoming, {}, 0, MIB, True, wait_for_media=True) == "stored"
+    assert store.status()["messages"] == 3 and store.status()["media"] == 0
+
+
+def test_placeholder_messages_are_removed_before_older_text(store):
+    add(store, message(1, 100, text="x" * 220_000))
+    placeholder = message(2, 200)
+    placeholder["segments"] = [
+        {
+            "type": "image",
+            "data": {"file_id": "p" * 220_000},
+            "media": {"missing": "unavailable"},
+        }
+    ]
+    store.append(placeholder, {}, 1, MIB, False)
+    assert add(store, message(3, 300, text="z" * 660_000), rolling=True) == "stored"
+    assert [r["message_id"] for r in contents(store)[0]] == ["1", "3"]
+
+
+def test_two_workers_claim_once_and_recover_after_crash(store, tmp_path, monkeypatch):
+    import time
+
+    asset = asset_file(tmp_path, "p", 2000)
+    add(store, message(1, asset=asset), asset)
+    other = Archive(store.path.parent)
+    with ThreadPoolExecutor(max_workers=2) as pool:
+        claims = list(pool.map(lambda s: s.next_recognition(), (store, other)))
+    assert claims.count(None) == 1
+    first = next(job for job in claims if job is not None)
+    assert other.next_recognition() is None
+    monkeypatch.setattr(time, "time", lambda: first[3] + 1)
+    again = other.next_recognition()
+    assert first[:3] == again[:3]
+    store.release_recognition(asset.digest, first[3], retry=True)
+    assert store.next_recognition() is None
+    other.release_recognition(asset.digest, again[3], retry=False)
+    assert store.next_recognition()[:3] == first[:3]

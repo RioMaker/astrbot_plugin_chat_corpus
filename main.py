@@ -18,6 +18,7 @@ from .exports import ExportJob
 from .groups import GroupDirectory
 from .ingest import snapshot
 from .media import MediaReader
+from .recognition import provider_for, recognize
 from .settings import PLUGIN, ExportRange, Settings
 
 
@@ -44,6 +45,10 @@ class ChatCorpus(Star):
         self.lock = asyncio.Lock()
         self.slots = asyncio.Semaphore(4)
         self.pending = set()
+        self.recognition_wake = asyncio.Event()
+        self.recognition_progress = asyncio.Event()
+        self.recognition_task = None
+        self.provider_call = None
         self.exports = {}
         self.errors = 0
         self.stopped = False
@@ -68,6 +73,70 @@ class ChatCorpus(Star):
             cookie_jar=aiohttp.DummyCookieJar(),
         )
         TargetGroup.active = self.settings
+        self.recognition_task = asyncio.create_task(self._recognition_loop())
+
+    async def _recognize_one(self, digest, ext, origin):
+        async with asyncio.timeout(30):
+            provider = await provider_for(self.context, origin, ext)
+        if not provider or self.stopped:
+            return False
+        with tempfile.TemporaryDirectory(prefix="chat-corpus-recognition-") as folder:
+            path = Path(folder) / f"original.{ext}"
+            if not await asyncio.to_thread(self.store.copy_original, digest, path):
+                return True
+            if self.stopped:
+                return False
+            self.provider_call = asyncio.create_task(
+                recognize(self.context, provider, path, origin)
+            )
+            try:
+                async with asyncio.timeout(120):
+                    result = await self.provider_call
+            finally:
+                self.provider_call = None
+        if not result:
+            return False
+        async with self.lock:
+            return await asyncio.to_thread(
+                self.store.save_recognition, digest, result, self.settings
+            )
+
+    async def _recognition_loop(self):
+        while not self.stopped:
+            self.recognition_wake.clear()
+            try:
+                job = await asyncio.to_thread(self.store.next_recognition)
+                if job:
+                    digest, ext, origin, lease = job
+                    saved = False
+                    try:
+                        if not self.stopped:
+                            saved = await self._recognize_one(digest, ext, origin)
+                    except asyncio.CancelledError:
+                        if self.stopped or asyncio.current_task().cancelling():
+                            raise
+                    except Exception as exc:  # noqa: BLE001 -- provider errors can include raw chat content
+                        logger.warning(
+                            "[对话语料库] 媒体识别稍后重试：%s", type(exc).__name__
+                        )
+                    finally:
+                        if not saved:
+                            await asyncio.to_thread(
+                                self.store.release_recognition,
+                                digest,
+                                lease,
+                                retry=not self.stopped,
+                            )
+                        self.recognition_progress.set()
+                        self.recognition_progress = asyncio.Event()
+                    continue
+            except Exception as exc:  # noqa: BLE001 -- recover the durable queue after a storage error
+                logger.error("[对话语料库] 读取识别队列失败：%s", type(exc).__name__)
+            if not self.stopped:
+                try:
+                    await asyncio.wait_for(self.recognition_wake.wait(), timeout=60)
+                except TimeoutError:
+                    pass
 
     def _dashboard(self, handler):
         async def guarded():
@@ -101,7 +170,9 @@ class ChatCorpus(Star):
                 self.slots.release()
                 return
             call = getattr(getattr(event, "bot", None), "call_action", None)
-            task = asyncio.create_task(self._capture(incoming, call))
+            task = asyncio.create_task(
+                self._capture(incoming, call, event.unified_msg_origin)
+            )
             self.pending.add(task)
             task.add_done_callback(self.pending.discard)
         except Exception as exc:  # noqa: BLE001 -- a malformed event must not stop other plugins
@@ -111,7 +182,7 @@ class ChatCorpus(Star):
         self.errors += 1
         logger.error("[对话语料库] 写入消息失败：%s", type(exc).__name__)
 
-    async def _capture(self, incoming, call):
+    async def _capture(self, incoming, call, origin):
         try:
             record = incoming.record
             if await asyncio.to_thread(self.store.contains, record):
@@ -121,22 +192,41 @@ class ChatCorpus(Star):
                 assets, missing = await incoming.collect(
                     reader, folder, self.settings.limit
                 )
-                async with self.lock:
-                    # The group or quota may have changed while media was downloading.
-                    current = self.settings
-                    if record["group_id"] in current.group_ids:
-                        await asyncio.to_thread(
-                            self.store.append,
-                            record,
-                            assets,
-                            missing,
-                            current.limit,
-                            current.rolling,
-                        )
+                await self._append(record, assets, missing, origin)
         except Exception as exc:  # noqa: BLE001 -- surface background failures in archive status
             self._capture_error(exc)
         finally:
             self.slots.release()
+
+    async def _append(self, record, assets, missing, origin):
+        # Give an already queued original a chance to release space before rotating text.
+        # Do not hold the settings/archive locks while the provider is working.
+        loop = asyncio.get_running_loop()
+        deadline = loop.time() + 125
+        while True:
+            async with self.lock:
+                current = self.settings
+                if record["group_id"] not in current.group_ids:
+                    return
+                progress = self.recognition_progress
+                result = await asyncio.to_thread(
+                    self.store.append,
+                    record,
+                    assets,
+                    missing,
+                    current.limit,
+                    current.rolling,
+                    origin,
+                    wait_for_media=not self.stopped and loop.time() < deadline,
+                )
+                self.recognition_wake.set()
+            if result != "waiting":
+                return
+            try:
+                async with asyncio.timeout_at(deadline):
+                    await progress.wait()
+            except TimeoutError:
+                pass
 
     async def state(self):
         async with self.lock:
@@ -180,6 +270,7 @@ class ChatCorpus(Star):
             self.settings = updated
             TargetGroup.active = updated
             await asyncio.to_thread(self.store.apply_limit, updated)
+            self.recognition_wake.set()
         return json_response({"settings": updated.public()})
 
     def _forget_export(self, owner, job):
@@ -266,6 +357,12 @@ class ChatCorpus(Star):
 
     async def terminate(self):
         self.stopped = True
+        self.recognition_wake.set()
+        self.recognition_progress.set()
+        if self.provider_call is not None:
+            self.provider_call.cancel()
+        if self.recognition_task is not None:
+            await asyncio.gather(self.recognition_task, return_exceptions=True)
         jobs = list(self.exports.items())
         if jobs:
             await asyncio.gather(*(job.task for _, job in jobs))

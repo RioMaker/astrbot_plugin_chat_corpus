@@ -27,8 +27,8 @@ function retention() {
   const rolling = field("rolling").checked;
   const capacity = Number(field("capacity").value);
   const pruneNow = rolling && capacity > 0 && used > capacity * mib;
-  const text = pruneNow ? "当前用量超过新上限，保存后会立即清理最旧的消息。"
-    : rolling ? "空间不足时，从所有归档群中按消息时间删除最旧记录。"
+  const text = pruneNow ? "保存后先释放已识别的原件。等待识别期间，用量可能暂时高于新上限。"
+    : rolling ? "空间不足时先清已识别的图片和语音，尽量保留聊天原文和识别文字。"
       : "空间不足时保留已有记录，跳过放不下的新消息。";
   notice("retention", text, pruneNow);
 }
@@ -140,7 +140,9 @@ async function refresh() {
   field("media").textContent = state.media.toLocaleString();
   const details = [
     [state.pending, "条正在入库"], [state.missing, "个媒体未取到"],
-    [state.evicted, "条累计清理"], [state.skipped, "条因容量跳过"],
+    [state.recognized, "个附件已存识别文字"], [state.awaiting_recognition, "个附件待识别"],
+    [state.retrying_recognition, "个附件等待重试"], [state.cleared_media, "个原件累计释放"],
+    [state.evicted, "条消息累计清理"], [state.skipped, "条因容量跳过"],
     [state.errors, "次本次运行写入失败"]
   ].filter(([n]) => n > 0).map(([n, label]) => n + " " + label);
   field("details").textContent = details.join(" · ");

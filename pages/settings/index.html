@@ -37,6 +37,7 @@
         <input id="capacity" type="number" inputmode="numeric" min="1" max="2147483647" step="1" required>
         <label class="toggle"><input id="rolling" type="checkbox">开启动态存储</label>
         <small id="retention"></small>
+        <small>媒体识别使用该群所配置的图片转述模型和语音转文本服务。</small>
         <button type="submit" id="save">保存设置</button>
       </fieldset>
       <p class="feedback" role="status" id="saveResult"></p>
@@ -52,7 +53,7 @@
         </div>
         <small>按本地日期筛选，包含首尾两天。留空导出全部日期。仍在采集的消息入库后可在下次导出。</small>
         <div class="contents"><strong>ZIP 内容</strong>
-          <span><code>messages.jsonl</code>按时间排序的消息</span>
+          <span><code>messages.jsonl</code>聊天原文、图片识别与语音转写</span>
           <span><code>media/</code>消息引用的图片和语音</span>
           <span><code>manifest.json</code>导出范围与数量</span>
         </div>

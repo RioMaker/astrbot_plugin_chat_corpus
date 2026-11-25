@@ -9,7 +9,17 @@ import threading
 import time
 import zipfile
 from contextlib import closing, contextmanager
+from copy import deepcopy
 from pathlib import Path
+
+from .recognition import usable_text
+from .retention import (
+    apply_rolling_limit,
+    queue_legacy_media,
+    reclaim_files,
+    reclaim_messages,
+    used_bytes,
+)
 
 CHUNK = 256 * 1024
 SCHEMA = """
@@ -38,7 +48,7 @@ END;
 CREATE TABLE IF NOT EXISTS counters (
     id INTEGER PRIMARY KEY CHECK(id = 1), evicted INTEGER NOT NULL, skipped INTEGER NOT NULL
 );
-INSERT OR IGNORE INTO counters VALUES (1, 0, 0);
+INSERT OR IGNORE INTO counters(id,evicted,skipped) VALUES (1, 0, 0);
 """
 
 
@@ -50,25 +60,54 @@ def media_name(digest, ext):
     return f"media/{digest}.{ext}"
 
 
-def used_bytes(db):
-    pages = db.execute("PRAGMA page_count").fetchone()[0]
-    free = db.execute("PRAGMA freelist_count").fetchone()[0]
-    return (pages - free) * db.execute("PRAGMA page_size").fetchone()[0]
+def segments(parts):
+    for part in parts:
+        if not isinstance(part, dict):
+            continue
+        yield part
+        data = part.get("data")
+        if isinstance(data, dict):
+            for key in ("content", "messages", "message"):
+                if isinstance(children := data.get(key), list):
+                    yield from segments(children)
 
 
-def trim(db, limit, protected=None):
-    removed = 0
-    while used_bytes(db) > limit:
-        row = db.execute(
-            "SELECT id FROM messages ORDER BY ts, arrived, id LIMIT 1"
-        ).fetchone()
-        if row is None or row[0] == protected:
-            return False
-        db.execute("DELETE FROM messages WHERE id = ?", (row[0],))
-        removed += 1
-    if removed:
-        db.execute("UPDATE counters SET evicted = evicted + ? WHERE id = 1", (removed,))
-    return True
+def has_chat_text(record):
+    for part in segments(record["segments"]):
+        data = part.get("data")
+        if not isinstance(data, dict):
+            continue
+        if part.get("type") == "text" and str(data.get("text") or "").strip():
+            return True
+        if (
+            part.get("type") == "node"
+            and isinstance(data.get("content"), str)
+            and data["content"].strip()
+        ):
+            return True
+    return False
+
+
+def migrate(db):
+    if db.execute("PRAGMA user_version").fetchone()[0] >= 2:
+        return
+    # Legacy files become eligible on the first capacity pressure.
+    # Keep frequent queue updates off the rows containing the large original BLOBs.
+    db.execute("""CREATE TABLE media_text (
+        asset INTEGER PRIMARY KEY REFERENCES media(id) ON DELETE CASCADE,
+        recognition TEXT, next_try INTEGER, origin TEXT, lease_until INTEGER NOT NULL DEFAULT 0
+    )""")
+    db.execute("INSERT INTO media_text(asset) SELECT id FROM media")
+    db.execute("ALTER TABLE messages ADD COLUMN has_text INTEGER NOT NULL DEFAULT 0")
+    db.execute("ALTER TABLE counters ADD COLUMN cleared INTEGER NOT NULL DEFAULT 0")
+    for msg_id, payload in db.execute("SELECT id,payload FROM messages ORDER BY id"):
+        if has_chat_text(json.loads(payload)):
+            db.execute("UPDATE messages SET has_text=1 WHERE id=?", (msg_id,))
+    db.execute(
+        "CREATE INDEX recognition_queue ON media_text(next_try,asset) WHERE recognition IS NULL"
+    )
+    db.execute("CREATE INDEX retention_order ON messages(has_text,ts,arrived,id)")
+    db.execute("PRAGMA user_version=2")
 
 
 class Archive:
@@ -90,15 +129,16 @@ class Archive:
             db.execute("PRAGMA auto_vacuum = FULL")
             db.execute("PRAGMA journal_mode = WAL")
             db.executescript(SCHEMA)
+            db.execute("BEGIN IMMEDIATE")
+            migrate(db)
             if settings.rolling:
-                db.execute("BEGIN IMMEDIATE")
-                trim(db, settings.limit)
+                apply_rolling_limit(db, settings.limit)
 
     def apply_limit(self, settings):
         if settings.rolling:
             with self.connection() as db:
                 db.execute("BEGIN IMMEDIATE")
-                trim(db, settings.limit)
+                apply_rolling_limit(db, settings.limit)
 
     @staticmethod
     def _key(record):
@@ -117,58 +157,225 @@ class Archive:
             )
 
     @staticmethod
-    def _asset(db, item):
-        row = db.execute(
-            "SELECT id FROM media WHERE digest=?", (item.digest,)
-        ).fetchone()
-        if row:
-            return row[0]
+    def _reserve_asset(db, item, origin):
         asset_id = db.execute(
-            "INSERT INTO media(digest, ext, body) VALUES(?, ?, zeroblob(?))",
+            "INSERT INTO media(digest,ext,body) VALUES(?,?,zeroblob(?))",
             (item.digest, item.ext, item.size),
         ).lastrowid
-        with (
-            item.path.open("rb") as src,
-            db.blobopen("media", "body", asset_id) as dest,
-        ):
-            shutil.copyfileobj(src, dest, CHUNK)
+        db.execute(
+            "INSERT INTO media_text(asset,next_try,origin) VALUES(?,unixepoch(),?)",
+            (asset_id, origin),
+        )
         return asset_id
 
-    def append(self, record, assets, missing, limit, rolling):
+    def _try_append(
+        self, db, record, known, new, missing, limit, rolling, origin, wait_for_media
+    ):
         payload = encode(record)
+        if len(payload.encode()) + sum(item.size for item in new) > limit:
+            return False
+        has_text = has_chat_text(record) or any(
+            recognized for _, recognized in known.values()
+        )
+        db.execute("SAVEPOINT candidate")
+        msg_id = db.execute(
+            """INSERT INTO messages(platform_id,self_id,group_id,message_id,ts,arrived,payload,missing,has_text)
+               VALUES(?,?,?,?,?,?,?,?,?)""",
+            (
+                *self._key(record),
+                record["timestamp"],
+                record["received_ns"],
+                payload,
+                missing,
+                has_text,
+            ),
+        ).lastrowid
+        ids = [asset_id for asset_id, _ in known.values()]
+        db.executemany(
+            """UPDATE media_text SET next_try=unixepoch(),origin=coalesce(origin,?)
+               WHERE asset=? AND recognition IS NULL AND next_try IS NULL""",
+            ((origin, asset_id) for asset_id in ids),
+        )
+        reserved = [(self._reserve_asset(db, item, origin), item) for item in new]
+        ids.extend(asset_id for asset_id, _ in reserved)
+        db.executemany(
+            "INSERT INTO refs VALUES(?,?)", ((msg_id, asset_id) for asset_id in ids)
+        )
+        fits = reclaim_files(db, limit) if rolling else used_bytes(db) <= limit
+        if not fits and rolling:
+            allow_text = has_text and not new
+            if allow_text and wait_for_media:
+                allow_text = not self._recognition_due(db)
+            fits = reclaim_messages(db, limit, protected=msg_id, allow_text=allow_text)
+        if fits:
+            for asset_id, item in reserved:
+                with (
+                    item.path.open("rb") as src,
+                    db.blobopen("media", "body", asset_id) as dest,
+                ):
+                    shutil.copyfileobj(src, dest, CHUNK)
+        else:
+            db.execute("ROLLBACK TO candidate")
+        db.execute("RELEASE candidate")
+        return fits
+
+    @staticmethod
+    def _recognition_due(db):
+        return (
+            db.execute(
+                "SELECT 1 FROM media_text WHERE recognition IS NULL AND next_try<=? LIMIT 1",
+                (int(time.time()),),
+            ).fetchone()
+            is not None
+        )
+
+    def append(
+        self,
+        record,
+        assets,
+        missing,
+        limit,
+        rolling,
+        origin=None,
+        *,
+        wait_for_media=False,
+    ):
         with self.connection() as db:
             db.execute("BEGIN IMMEDIATE")
-            db.execute("SAVEPOINT candidate")
-            row = db.execute(
-                """INSERT INTO messages(platform_id,self_id,group_id,message_id,ts,arrived,payload,missing)
-                   VALUES(?,?,?,?,?,?,?,?) ON CONFLICT(platform_id,self_id,group_id,message_id) DO NOTHING""",
-                (
-                    *self._key(record),
-                    record["timestamp"],
-                    record["received_ns"],
-                    payload,
-                    missing,
-                ),
-            )
-            if not row.rowcount:
+            if db.execute(
+                "SELECT 1 FROM messages WHERE platform_id=? AND self_id=? AND group_id=? AND message_id=?",
+                self._key(record),
+            ).fetchone():
                 return "duplicate"
-            msg_id = row.lastrowid
-            # If even the content alone is too large, keep the entire existing history.
-            fits = (
-                sum(item.size for item in assets.values()) + len(payload.encode())
-                <= limit
+            known, new = {}, []
+            for digest, item in assets.items():
+                row = db.execute(
+                    "SELECT a.id,t.recognition IS NOT NULL FROM media a JOIN media_text t ON t.asset=a.id WHERE a.digest=?",
+                    (digest,),
+                ).fetchone()
+                if row:
+                    known[digest] = row
+                else:
+                    new.append(item)
+            if self._try_append(
+                db, record, known, new, missing, limit, rolling, origin, wait_for_media
+            ):
+                return "stored"
+            if rolling:
+                queue_legacy_media(db)
+                if new and (has_chat_text(record) or known):
+                    # Refuse new originals before allowing older text to roll out.
+                    partial = deepcopy(record)
+                    for part in segments(partial["segments"]):
+                        media = part.get("media", {})
+                        if "path" in media and media.get("sha256") not in known:
+                            part["media"] = {
+                                k: v for k, v in media.items() if k != "path"
+                            }
+                            part["media"]["missing"] = "capacity_skipped"
+                            missing += 1
+                    if self._try_append(
+                        db,
+                        partial,
+                        known,
+                        [],
+                        missing,
+                        limit,
+                        rolling,
+                        origin,
+                        wait_for_media,
+                    ):
+                        return "stored"
+                if wait_for_media and self._recognition_due(db):
+                    return "waiting"
+            db.execute("UPDATE counters SET skipped=skipped+1 WHERE id=1")
+            return "full"
+
+    def next_recognition(self):
+        with self.connection() as db:
+            db.execute("BEGIN IMMEDIATE")
+            now = int(time.time())
+            row = db.execute(
+                """
+                SELECT a.id,a.digest,a.ext,coalesce(t.origin, (
+                    SELECT m.platform_id || ':GroupMessage:' || m.group_id FROM refs r
+                    JOIN messages m ON m.id=r.message WHERE r.asset=a.id ORDER BY m.id LIMIT 1
+                )) FROM media_text t JOIN media a ON a.id=t.asset
+                WHERE t.recognition IS NULL AND t.next_try<=? AND t.lease_until<=?
+                ORDER BY t.next_try,t.asset LIMIT 1
+            """,
+                (now, now),
+            ).fetchone()
+            if row is None:
+                return None
+            # A second instance cannot submit this file during a reload. A crashed
+            # worker's lease expires after the provider timeout plus staging time.
+            lease = now + 300
+            db.execute(
+                "UPDATE media_text SET lease_until=? WHERE asset=?", (lease, row[0])
             )
-            if fits:
-                for item in assets.values():
-                    db.execute(
-                        "INSERT INTO refs VALUES(?,?)", (msg_id, self._asset(db, item))
-                    )
-                fits = trim(db, limit, msg_id) if rolling else used_bytes(db) <= limit
+            return (*row[1:], lease)
+
+    def copy_original(self, digest, path):
+        # Copy using a WAL snapshot so staging a large attachment does not block captures.
+        with closing(sqlite3.connect(self.path, timeout=30)) as db:
+            db.execute("BEGIN")
+            row = db.execute(
+                "SELECT a.id FROM media a JOIN media_text t ON t.asset=a.id WHERE a.digest=? AND t.recognition IS NULL",
+                (digest,),
+            ).fetchone()
+            if row is None:
+                return False
+            with (
+                db.blobopen("media", "body", row[0], readonly=True) as src,
+                path.open("wb") as out,
+            ):
+                shutil.copyfileobj(src, out, CHUNK)
+            return True
+
+    def release_recognition(self, digest, lease, *, retry):
+        with self.connection() as db:
+            db.execute(
+                """UPDATE media_text SET next_try=?,lease_until=0 WHERE asset=(SELECT id FROM media WHERE digest=?)
+                   AND recognition IS NULL AND lease_until=?""",
+                (int(time.time()) + (600 if retry else 0), digest, lease),
+            )
+
+    def save_recognition(self, digest, result, settings):
+        with self.connection() as db:
+            db.execute("BEGIN IMMEDIATE")
+            row = db.execute(
+                "SELECT a.id,a.ext FROM media a JOIN media_text t ON t.asset=a.id WHERE a.digest=? AND t.recognition IS NULL",
+                (digest,),
+            ).fetchone()
+            if row is None:
+                return True
+            text = usable_text(row[1], result)
+            if text is None:
+                return False
+            annotation = encode(text)
+            if len(annotation.encode()) > settings.limit:
+                return False
+            previous = used_bytes(db)
+            db.execute("SAVEPOINT annotation")
+            db.execute(
+                "UPDATE media_text SET recognition=?,next_try=NULL,lease_until=0 WHERE asset=?",
+                (annotation, row[0]),
+            )
+            db.execute(
+                "UPDATE messages SET has_text=1 WHERE id IN (SELECT message FROM refs WHERE asset=?)",
+                (row[0],),
+            )
+            if settings.rolling:
+                reclaim_files(db, settings.limit)
+            # A previous limit reduction may already be waiting for other originals.
+            fits = used_bytes(db) <= max(settings.limit, previous)
             if not fits:
-                db.execute("ROLLBACK TO candidate")
-                db.execute("UPDATE counters SET skipped = skipped + 1 WHERE id = 1")
-            db.execute("RELEASE candidate")
-            return "stored" if fits else "full"
+                db.execute("ROLLBACK TO annotation")
+            elif settings.rolling and previous > settings.limit:
+                apply_rolling_limit(db, settings.limit)
+            db.execute("RELEASE annotation")
+            return fits
 
     def status(self):
         with self.connection() as db:
@@ -178,14 +385,23 @@ class Archive:
                     "SELECT group_id, count(*), max(ts) FROM messages GROUP BY group_id ORDER BY group_id"
                 )
             ]
-            evicted, skipped = db.execute(
-                "SELECT evicted, skipped FROM counters"
+            evicted, skipped, cleared = db.execute(
+                "SELECT evicted,skipped,cleared FROM counters"
             ).fetchone()
+            files, recognized, waiting, retrying = db.execute("""
+                SELECT count(*) FILTER (WHERE length(body)>0), count(recognition),
+                       count(*) FILTER (WHERE recognition IS NULL),
+                       count(*) FILTER (WHERE next_try>unixepoch()) FROM media_text t JOIN media a ON a.id=t.asset
+            """).fetchone()
             return {
                 "groups": groups,
                 "messages": sum(g["messages"] for g in groups),
                 "used_bytes": used_bytes(db),
-                "media": db.execute("SELECT count(*) FROM media").fetchone()[0],
+                "media": files,
+                "recognized": recognized,
+                "awaiting_recognition": waiting,
+                "retrying_recognition": retrying,
+                "cleared_media": cleared,
                 "missing": db.execute(
                     "SELECT coalesce(sum(missing),0) FROM messages"
                 ).fetchone()[0],
@@ -214,7 +430,13 @@ class Archive:
             ):
                 db.execute("PRAGMA query_only = ON")
                 db.execute("BEGIN")
-                counts = {"messages": 0, "media_files": 0, "missing_media_segments": 0}
+                counts = {
+                    "messages": 0,
+                    "media_files": 0,
+                    "missing_media_segments": 0,
+                    "recognized_media_segments": 0,
+                    "cleared_media_segments": 0,
+                }
 
                 def report():
                     if progress is not None:
@@ -223,14 +445,35 @@ class Archive:
                         )
 
                 query = (
-                    "SELECT m.payload, m.missing FROM messages m"
+                    """SELECT m.payload,m.missing,(
+                        SELECT json_group_object(a.digest,json_object(
+                            'text',json(t.recognition),'original',length(a.body)>0
+                        )) FROM refs r JOIN media a ON a.id=r.asset JOIN media_text t ON t.asset=a.id
+                        WHERE r.message=m.id AND t.recognition IS NOT NULL
+                    ) FROM messages m"""
                     + where
                     + " ORDER BY m.ts,m.arrived,m.id"
                 )
                 with io.BufferedWriter(
                     bundle.open("messages.jsonl", "w", force_zip64=True), CHUNK
                 ) as lines:
-                    for payload, missing in db.execute(query, args):
+                    for payload, missing, annotations in db.execute(query, args):
+                        if annotations != "{}":
+                            record = json.loads(payload)
+                            by_digest = json.loads(annotations)
+                            for part in segments(record["segments"]):
+                                ref = part.get("media", {})
+                                annotation = by_digest.get(ref.get("sha256"))
+                                if "path" not in ref or annotation is None:
+                                    continue
+                                part["recognition"] = annotation["text"]
+                                counts["recognized_media_segments"] += 1
+                                if not annotation["original"]:
+                                    del ref["path"]
+                                    ref["missing"] = "capacity_evicted"
+                                    missing += 1
+                                    counts["cleared_media_segments"] += 1
+                            payload = encode(record)
                         lines.write(payload.encode("utf-8") + b"\n")
                         counts["messages"] += 1
                         counts["missing_media_segments"] += missing
@@ -244,7 +487,7 @@ class Archive:
                         "SELECT r.asset FROM messages m JOIN refs r ON r.message=m.id"
                         + where
                     )
-                query = f"SELECT id,digest,ext FROM media WHERE id IN ({assets})"
+                query = f"SELECT id,digest,ext FROM media WHERE length(body)>0 AND id IN ({assets})"
                 for asset_id, digest, ext in db.execute(query, args):
                     name = media_name(digest, ext)
                     entry = name if ext == "wav" else zipfile.ZipInfo(name)
@@ -261,7 +504,7 @@ class Archive:
                     "manifest.json",
                     encode(
                         {
-                            "schema_version": 1,
+                            "schema_version": 2,
                             "exported_at": int(time.time()),
                             "group_id": selection.group_id or None,
                             "since": selection.since,

@@ -59,6 +59,7 @@ def extension(header, kind):
     else:
         for prefix, ext in (
             (b"\x02#!SILK_V3", "silk"),
+            (b"\x03#!SILK_V3", "silk"),
             (b"#!SILK_V3", "silk"),
             (b"#!AMR", "amr"),
             (b"OggS", "ogg"),
