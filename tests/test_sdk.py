@@ -86,6 +86,9 @@ def test_sdk_capture_settings_download_and_reload(tmp_path, monkeypatch):
         await plugin.initialize()
         try:
             assert (await request_to("export", actor=None)).status_code == 401
+            assert (
+                await request_to("export/start", method="POST", actor=None)
+            ).status_code == 401
             assert (await request_to("groups", actor=None)).status_code == 401
             listing = json.loads((await request_to("groups")).body)
             assert listing["groups"] == [
@@ -124,7 +127,7 @@ def test_sdk_capture_settings_download_and_reload(tmp_path, monkeypatch):
             ).status_code == 400
 
             adapter = object.__new__(AiocqhttpAdapter)
-            voice = b"ID3" + bytes(1234)
+            voice = b"ID3" + bytes(600_000)
             voice_path = tmp_path / "voice.mp3"
             voice_path.write_bytes(voice)
             adapter.bot = SimpleNamespace(
@@ -159,8 +162,72 @@ def test_sdk_capture_settings_download_and_reload(tmp_path, monkeypatch):
             await deliver(native)
             await deliver(Event({**native, "message_id": 91, "group_id": 9999}))
             await deliver(native)
-            stream = await request_to("export", query={"group_id": "12345"})
-            data = b"".join([chunk async for chunk in stream.body_iterator])
+            await asyncio.gather(*tuple(plugin.pending))
+
+            # A pending OneBot download must neither hold up a ZIP nor get cancelled by it.
+            started, release = asyncio.Event(), asyncio.Event()
+
+            async def slow_action(*_args, **_kwargs):
+                started.set()
+                await release.wait()
+                return {"file": str(voice_path)}
+
+            adapter.bot.call_action.side_effect = slow_action
+            await deliver(Event({**native, "message_id": 92}))
+            try:
+                async with asyncio.timeout(5):
+                    await started.wait()
+                    selection = {"group_id": "12345", "since": 123455, "before": 123457}
+                    legacy = await request_to("export", query=selection)
+                    assert legacy.status_code == 200
+                    with zipfile.ZipFile(
+                        io.BytesIO(b"".join([c async for c in legacy.body_iterator]))
+                    ) as bundle:
+                        assert json.loads(bundle.read("manifest.json"))["messages"] == 1
+                    start = await request_to(
+                        "export/start", method="POST", body=selection
+                    )
+                    assert start.status_code == 202
+                    job = json.loads(start.body)
+                    ticket = {"id": job["id"]}
+                    assert (
+                        await request_to("export/status", query=ticket, actor="other")
+                    ).status_code == 404
+                    assert (
+                        await request_to("export", query=ticket, actor="other")
+                    ).status_code == 404
+                    while job["phase"] == "packing":
+                        await asyncio.sleep(0.01)
+                        job = json.loads(
+                            (await request_to("export/status", query=ticket)).body
+                        )
+                    assert (
+                        job["phase"] == "ready"
+                        and job["messages"] == job["media_files"] == 1
+                    )
+                    stream = await request_to("export", query=ticket)
+                    chunks = [
+                        await anext(stream.body_iterator),
+                        await anext(stream.body_iterator),
+                    ]
+                    sending = json.loads(
+                        (await request_to("export/status", query=ticket)).body
+                    )
+                    assert sending["phase"] == "sending" and sending["sent"] == len(
+                        chunks[0]
+                    )
+                    chunks.extend([chunk async for chunk in stream.body_iterator])
+                    data = b"".join(chunks)
+                    assert job["size"] == len(data)
+                    finished = json.loads(
+                        (await request_to("export/status", query=ticket)).body
+                    )
+                    assert finished["phase"] == "sent" and finished["sent"] == len(data)
+                    assert (await request_to("export", query=ticket)).status_code == 409
+                    assert len(plugin.pending) == 1
+            finally:
+                release.set()
+                await asyncio.gather(*tuple(plugin.pending))
             assert stream.status_code == 200 and int(
                 stream.headers["content-length"]
             ) == len(data)
@@ -170,7 +237,11 @@ def test_sdk_capture_settings_download_and_reload(tmp_path, monkeypatch):
                 assert row["segments"][0]["data"]["text"] == "  原文  "
                 assert bundle.read(row["segments"][1]["media"]["path"]) == voice
             status = json.loads((await request_to("state")).body)
-            assert status["messages"] == status["media"] == 1 and status["errors"] == 0
+            assert (
+                status["messages"] == 2
+                and status["media"] == 1
+                and status["errors"] == 0
+            )
             assert [g["group_id"] for g in status["groups"]] == ["12345"]
 
             # A disk error saving settings must leave both the old allowance and archive intact.
@@ -194,7 +265,7 @@ def test_sdk_capture_settings_download_and_reload(tmp_path, monkeypatch):
         second = ChatCorpus(context, config)
         await second.initialize()
         try:
-            assert json.loads((await request_to("state")).body)["messages"] == 1
+            assert json.loads((await request_to("state")).body)["messages"] == 2
         finally:
             await second.terminate()
 

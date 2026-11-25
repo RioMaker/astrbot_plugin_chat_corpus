@@ -193,6 +193,47 @@ function dayBoundary(value, nextDay) {
   return Math.floor(date.getTime() / 1000);
 }
 
+async function downloadCorpus(params) {
+  let job = await bridge.apiPost("export/start", params);
+  const ticket = {id: job.id};
+  while (job.phase === "packing") {
+    notice("exportResult", "正在打包已入库的记录，已处理 " + job.messages.toLocaleString() +
+      " 条消息、" + job.media_files.toLocaleString() + " 个附件，已写入 " + size(job.packed_bytes) + "。");
+    await new Promise(resolve => setTimeout(resolve, 750));
+    job = await bridge.apiGet("export/status", ticket);
+  }
+  if (job.phase === "failed") throw new Error("打包失败，请检查服务器的临时磁盘空间及读写权限后重试。");
+  if (job.phase !== "ready") throw new Error("此语料包已被领取，请查看浏览器的下载记录。");
+
+  const total = size(job.size);
+  notice("exportResult", "ZIP 已生成（" + total + "），正在传给浏览器。接收完成后可保存文件。");
+  let downloading = true, timer;
+  async function showTransfer() {
+    try {
+      const state = await bridge.apiGet("export/status", ticket);
+      if (!downloading) return;
+      if (state.phase === "sent") {
+        notice("exportResult", "服务器已发送全部 " + total + "，正在等待浏览器完成接收。");
+        return;
+      }
+      if (state.phase === "sending") {
+        notice("exportResult", "ZIP 已生成，服务器已发送 " + size(state.sent) + " / " + total +
+          "。请保持此页打开，浏览器接收完成后可保存文件。");
+      }
+    } catch {
+      // A failed progress request does not interrupt the file transfer.
+    }
+    if (downloading) timer = setTimeout(showTransfer, 1500);
+  }
+  timer = setTimeout(showTransfer, 1500);
+  try {
+    return await bridge.download("export", ticket);
+  } finally {
+    downloading = false;
+    clearTimeout(timer);
+  }
+}
+
 field("export").addEventListener("submit", async event => {
   event.preventDefault();
   const params = {};
@@ -205,9 +246,9 @@ field("export").addEventListener("submit", async event => {
   if (end) params.before = dayBoundary(end, true);
   if (field("exportGroup").value) params.group_id = field("exportGroup").value;
   field("download").disabled = true;
-  notice("exportResult", "正在打包，请保持此页打开…");
+  notice("exportResult", "正在创建归档快照…");
   try {
-    await bridge.download("export", params);
+    await downloadCorpus(params);
     notice("exportResult", "语料包已交给浏览器下载。");
   } catch (error) { notice("exportResult", error.message, true); }
   finally { field("download").disabled = false; }

@@ -14,6 +14,7 @@ from astrbot.api.web import error_response, json_response, request, stream_respo
 from astrbot.core.utils.astrbot_path import get_astrbot_data_path
 
 from .archive import CHUNK, Archive
+from .exports import ExportJob
 from .groups import GroupDirectory
 from .ingest import snapshot
 from .media import MediaReader
@@ -43,6 +44,7 @@ class ChatCorpus(Star):
         self.lock = asyncio.Lock()
         self.slots = asyncio.Semaphore(4)
         self.pending = set()
+        self.exports = {}
         self.errors = 0
         self.stopped = False
         self.session = None
@@ -51,6 +53,8 @@ class ChatCorpus(Star):
             ("state", self.state, "GET"),
             ("groups", self.groups, "GET"),
             ("settings", self.save, "POST"),
+            ("export/start", self.start_export, "POST"),
+            ("export/status", self.export_status, "GET"),
             ("export", self.export, "GET"),
         ):
             view = self._dashboard(handler)
@@ -178,15 +182,59 @@ class ChatCorpus(Star):
             await asyncio.to_thread(self.store.apply_limit, updated)
         return json_response({"settings": updated.public()})
 
+    def _forget_export(self, owner, job):
+        if self.exports.get(owner) is job:
+            del self.exports[owner]
+        job.close()
+
+    async def start_export(self):
+        body = await request.json(default=None)
+        if not isinstance(body, dict):
+            return error_response("请提交导出范围", status_code=400)
+        selection = ExportRange.from_query(body)
+        owner = request.username
+        job = self.exports.get(owner)
+        if job is not None:
+            if job.phase in ("packing", "ready") and job.selection == selection:
+                return json_response(job.state())
+            if job.phase in ("packing", "sending"):
+                return error_response(
+                    "当前帐号已有导出正在进行，请稍后重试", status_code=409
+                )
+            self._forget_export(owner, job)
+        job = ExportJob(
+            self.store, selection, lambda done: self._forget_export(owner, done)
+        )
+        self.exports[owner] = job
+        return json_response(job.state(), status_code=202)
+
+    def _requested_export(self):
+        job = self.exports.get(request.username)
+        return job if job is not None and job.id == request.query.get("id") else None
+
+    async def export_status(self):
+        job = self._requested_export()
+        if job is None:
+            return error_response("导出已结束或已过期，请重新打包", status_code=404)
+        return json_response(job.state(), headers={"Cache-Control": "no-store"})
+
     async def export(self):
-        selection = ExportRange.from_query(request.query)
-        if self.pending:
-            # Include captures already dispatched at click time. A disconnected
-            # browser must not cancel their attachment downloads.
-            await asyncio.gather(
-                *(asyncio.shield(task) for task in tuple(self.pending))
-            )
-        bundle = await asyncio.to_thread(self.store.export, selection)
+        owner = request.username
+        job = None
+        if request.query.get("id") is None:
+            # Older dashboard pages and direct API clients request the ZIP in one call.
+            selection = ExportRange.from_query(request.query)
+            bundle = await asyncio.to_thread(self.store.export, selection)
+        else:
+            job = self._requested_export()
+            if job is None:
+                return error_response("导出已结束或已过期，请重新打包", status_code=404)
+            if job.phase != "ready":
+                return error_response(
+                    "当前语料包尚不可下载，请查看打包状态", status_code=409
+                )
+            selection = job.selection
+            bundle = job.take()
         filename = "chat-corpus-{}-{}.zip".format(
             selection.group_id or "all",
             datetime.now(UTC).strftime("%Y%m%dT%H%M%SZ"),
@@ -194,10 +242,17 @@ class ChatCorpus(Star):
 
         async def chunks():
             try:
+                if job is not None:
+                    job.timer.cancel()
                 while piece := await asyncio.to_thread(bundle.read, CHUNK):
                     yield piece
+                    if job is not None:
+                        job.sent += len(piece)
             finally:
                 bundle.close()
+                if job is not None and self.exports.get(owner) is job:
+                    job.phase = "sent" if job.sent == job.size else "interrupted"
+                    job.expire_later()
 
         return stream_response(
             chunks(),
@@ -211,6 +266,11 @@ class ChatCorpus(Star):
 
     async def terminate(self):
         self.stopped = True
+        jobs = list(self.exports.items())
+        if jobs:
+            await asyncio.gather(*(job.task for _, job in jobs))
+            for owner, job in jobs:
+                self._forget_export(owner, job)
         if TargetGroup.active is self.settings:
             TargetGroup.active = None
         if self.pending:

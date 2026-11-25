@@ -54,14 +54,16 @@ class ExportRange:
     @classmethod
     def from_query(cls, query):
         group = query.get("group_id", "")
-        if group and not GROUP_ID.fullmatch(group):
+        if not isinstance(group, str) or (group and not GROUP_ID.fullmatch(group)):
             raise ValueError("导出群号无效")
 
         def timestamp(key):
             value = query.get(key, "")
             if value == "":
                 return None
-            if not re.fullmatch(r"-?[0-9]{1,12}", value):
+            if type(value) is int:
+                value = str(value)
+            if not isinstance(value, str) or not re.fullmatch(r"-?[0-9]{1,12}", value):
                 raise ValueError("导出日期无效")
             return int(value)
 

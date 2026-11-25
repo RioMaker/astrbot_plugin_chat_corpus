@@ -2,7 +2,7 @@ name: astrbot_plugin_chat_corpus
 display_name: 对话语料库
 desc: 归档指定 QQ 群的消息、图片与语音，在管理页设置容量和滚动清理，按群和日期下载语料包。
 short_desc: 保存群聊原文和媒体，按容量管理并导出 ZIP。
-version: "0.1.0"
+version: "0.1.1"
 author: Rio
 repo: ""
 astrbot_version: ">=4.29.4,<5"

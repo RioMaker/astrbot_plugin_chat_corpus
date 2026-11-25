@@ -1,5 +1,6 @@
 """Transactional message and media storage, retention and portable ZIP snapshots."""
 
+import io
 import json
 import shutil
 import sqlite3
@@ -73,7 +74,7 @@ def trim(db, limit, protected=None):
 class Archive:
     def __init__(self, directory):
         self.path = Path(directory) / "corpus.sqlite3"
-        # A ZIP sees one consistent snapshot. The lock ends before the network download.
+        # Serialize short operations on the live archive. Exports use a WAL reader.
         self.lock = threading.Lock()
 
     @contextmanager
@@ -87,6 +88,7 @@ class Archive:
         self.path.parent.mkdir(parents=True, exist_ok=True)
         with self.connection() as db:
             db.execute("PRAGMA auto_vacuum = FULL")
+            db.execute("PRAGMA journal_mode = WAL")
             db.executescript(SCHEMA)
             if settings.rolling:
                 db.execute("BEGIN IMMEDIATE")
@@ -191,7 +193,7 @@ class Archive:
                 "skipped": skipped,
             }
 
-    def export(self, selection):
+    def export(self, selection, progress=None):
         filters, args = [], []
         for condition, value in (
             ("m.group_id=?", selection.group_id or None),
@@ -205,36 +207,56 @@ class Archive:
         result = tempfile.TemporaryFile(mode="w+b")  # noqa: SIM115 -- the response owns the open snapshot
         try:
             with (
-                self.connection() as db,
-                zipfile.ZipFile(result, "w", zipfile.ZIP_DEFLATED) as bundle,
+                closing(sqlite3.connect(self.path, timeout=30)) as db,
+                zipfile.ZipFile(
+                    result, "w", zipfile.ZIP_DEFLATED, compresslevel=1
+                ) as bundle,
             ):
+                db.execute("PRAGMA query_only = ON")
                 db.execute("BEGIN")
                 counts = {"messages": 0, "media_files": 0, "missing_media_segments": 0}
+
+                def report():
+                    if progress is not None:
+                        progress(
+                            counts["messages"], counts["media_files"], result.tell()
+                        )
+
                 query = (
                     "SELECT m.payload, m.missing FROM messages m"
                     + where
                     + " ORDER BY m.ts,m.arrived,m.id"
                 )
-                with bundle.open("messages.jsonl", "w", force_zip64=True) as lines:
+                with io.BufferedWriter(
+                    bundle.open("messages.jsonl", "w", force_zip64=True), CHUNK
+                ) as lines:
                     for payload, missing in db.execute(query, args):
                         lines.write(payload.encode("utf-8") + b"\n")
                         counts["messages"] += 1
                         counts["missing_media_segments"] += missing
-                query = (
-                    "SELECT DISTINCT a.id,a.digest,a.ext FROM messages m "
-                    "JOIN refs r ON m.id=r.message JOIN media a ON r.asset=a.id" + where
-                )
-                for asset_id, digest, ext in db.execute(query, args):
-                    entry = zipfile.ZipInfo(media_name(digest, ext))
-                    entry.compress_type = (
-                        zipfile.ZIP_DEFLATED if ext == "wav" else zipfile.ZIP_STORED
+                        if counts["messages"] % 256 == 0:
+                            report()
+                report()
+                # Deduplicate integer IDs before looking up rows containing large BLOBs.
+                assets = "SELECT asset FROM refs"
+                if where:
+                    assets = (
+                        "SELECT r.asset FROM messages m JOIN refs r ON r.message=m.id"
+                        + where
                     )
+                query = f"SELECT id,digest,ext FROM media WHERE id IN ({assets})"
+                for asset_id, digest, ext in db.execute(query, args):
+                    name = media_name(digest, ext)
+                    entry = name if ext == "wav" else zipfile.ZipInfo(name)
                     with (
                         db.blobopen("media", "body", asset_id, readonly=True) as src,
                         bundle.open(entry, "w", force_zip64=True) as dest,
                     ):
-                        shutil.copyfileobj(src, dest, CHUNK)
+                        while piece := src.read(CHUNK):
+                            dest.write(piece)
+                            report()
                     counts["media_files"] += 1
+                    report()
                 bundle.writestr(
                     "manifest.json",
                     encode(

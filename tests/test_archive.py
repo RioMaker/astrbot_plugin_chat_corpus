@@ -4,6 +4,7 @@ import sqlite3
 import zipfile
 from concurrent.futures import ThreadPoolExecutor
 from contextlib import closing
+from threading import Event
 
 import pytest
 from astrbot_plugin_chat_corpus.archive import Archive
@@ -189,3 +190,33 @@ def test_export_stays_consistent_during_retention(store, tmp_path):
             assert json.loads(bundle.read("messages.jsonl"))["message_id"] == "1"
             assert bundle.read(item.reference()["path"]) == item.path.read_bytes()
     assert store.status()["media"] == 0
+
+
+def test_export_of_existing_archive_allows_concurrent_retention(store, tmp_path):
+    item = asset_file(tmp_path, "a", 450_000)
+    add(store, message(1, asset=item), item)
+    # Simulate reopening a populated 0.1.0 database in rollback journal mode.
+    with closing(sqlite3.connect(store.path)) as db:
+        assert db.execute("PRAGMA journal_mode=DELETE").fetchone() == ("delete",)
+    store.initialize(Settings.read({}))
+    reading, release = Event(), Event()
+
+    def pause_after_messages(*_counts):
+        reading.set()
+        assert release.wait(5)
+
+    with ThreadPoolExecutor(max_workers=2) as pool:
+        exporting = pool.submit(store.export, ExportRange(), pause_after_messages)
+        try:
+            assert reading.wait(5)
+            writing = pool.submit(
+                add, store, message(2, 200, text="n" * 700_000), rolling=True
+            )
+            assert writing.result(timeout=3) == "stored"
+            assert store.status()["media"] == 0
+        finally:
+            release.set()
+        with exporting.result(timeout=5) as file, zipfile.ZipFile(file) as bundle:
+            assert bundle.testzip() is None
+            assert json.loads(bundle.read("messages.jsonl"))["message_id"] == "1"
+            assert bundle.read(item.reference()["path"]) == item.path.read_bytes()
